@@ -10,10 +10,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 from pydantic import BaseModel, Field
-# from langchain.vectorstores import Chroma
-# from langchain.embeddings import HuggingFaceEmbeddings
-
-
 
 _current_user_id: Optional[int] = None
 
@@ -49,233 +45,297 @@ VALID_USER_IDS = sorted(orders["user_id"].dropna().unique().tolist())
 
 # Pick the first user for simplicity and safety
 DEFAULT_USER_ID = VALID_USER_IDS[0]
-# TODO https://docs.google.com/document/d/15mUf7i_MH2VKgp4htI5Nu2b6gZJiCr2BJufFe69mWdo/edit?tab=t.0
+
+
+# TODO
 @tool
 def structured_search_tool(
-   product_name: Optional[str] = None,
-   department: Optional[Literal[tuple(DEPARTMENT_NAMES)]] = None,
-   aisle: Optional[str] = None,
-   reordered: Optional[bool] = None,
-   min_orders: Optional[int] = None,
-   order_by: Optional[Literal["count", "add_to_cart_order"]] = None,
-   ascending: Optional[bool] = False,
-   top_k: Optional[int] = None,
-   group_by: Optional[Literal["department", "aisle"]] = None,
-   history_only: Optional[bool] = False,
+    product_name: Optional[str] = None,
+    department: Optional[Literal[tuple(DEPARTMENT_NAMES)]] = None,
+    aisle: Optional[str] = None,
+    reordered: Optional[bool] = None,
+    min_orders: Optional[int] = None,
+    order_by: Optional[Literal["count", "add_to_cart_order"]] = None,
+    ascending: Optional[bool] = False,
+    top_k: Optional[int] = None,
+    group_by: Optional[Literal["department", "aisle"]] = None,
+    history_only: Optional[bool] = False,
 ) -> list:
-   """
-   A LangChain-compatible tool for structured product discovery across a grocery catalog and user purchase history.
+    """
+    A LangChain-compatible tool for structured product discovery across a grocery catalog and user purchase history.
 
 
-   This function is decorated with `@tool` to expose it to an LLM agent via LangGraph. It supports SQL-like filtering
-   over a product database, optionally constrained to the current user's order history. It returns either individual products
-   or group-wise summaries based on the provided arguments.
+    This function is decorated with `@tool` to expose it to an LLM agent via LangGraph. It supports SQL-like filtering
+    over a product database, optionally constrained to the current user's order history. It returns either individual products
+    or group-wise summaries based on the provided arguments.
 
 
-   ---
-   Tool Behavior Overview:
-   - Operates on two global pandas DataFrames:
-       • `products`: full catalog (from `products.csv`)
-       • `prior` + `orders`: user order history (from `order_products__prior.csv`, `orders.csv`)
-   - Uses additional joins with `departments.csv` and `aisles.csv` to enrich the product metadata.
-   - If `history_only=True`, it will:
-       • Look up the current user ID from `get_user_id()`
-       • Merge product purchases for that user
-       • Calculate statistics like reorder count, order frequency, and cart placement
-   - Applies filters conditionally based on which arguments are set.
-   - Optionally groups results by department or aisle.
+    ---
+    Examples:
+    ➤ Example 1: Find catalog items in pantry containing "peanut"
+    ```json
+    {
+        "product_name": "peanut",
+        "department": "pantry"
+    }
+    ```
 
 
-   ---
-   Parameters:
-   - `product_name` (str, optional): Case-insensitive substring match on product names.
-     Example: "almond" → matches "Almond Milk", "Almond Butter".
+    ➤ Example 2: Show reordered pantry products in my history
+    ```json
+    {
+        "department": "pantry",
+        "reordered": true,
+        "history_only": true
+    }
+    ```
 
 
-   - `department` (str, optional): Exact match against department names (from `DEPARTMENT_NAMES`).
-     Example: "beverages", "pantry", "produce".
+    ➤ Example 3: Top 5 most frequent purchases by user
+    ```json
+    {
+        "order_by": "count",
+        "top_k": 5,
+        "history_only": true
+    }
+    ```
 
 
-   - `aisle` (str, optional): Lowercased match on aisle name. Example: "organic snacks", "soy milk".
+    ➤ Example 4: Count of catalog items by department
+    ```json
+    {
+        "group_by": "department"
+    }
+    ```
 
 
-   - `reordered` (bool, optional): Only meaningful if `history_only=True`.
-     - `True` → return only products reordered at least once
-     - `False` → return products bought once, never reordered
+    ---
+    Returns:
+    - If `group_by` is used:
+      A list of dicts like:
+      ```json
+      [{"department": "pantry", "num_products": 132}, {"department": "beverages", "num_products": 89}]
+      ```
 
 
-   - `min_orders` (int, optional): Only meaningful if `history_only=True`.
-     Filters for items purchased this many times or more.
+    - Otherwise:
+      A list of dicts, each with:
+      ```json
+      {
+        "product_id": 24852,
+        "product_name": "Organic Bananas",
+        "aisle": "fresh fruits",
+        "department": "produce",
+        ... (optionally "count", "reordered", etc. if history_only=True)
+      }
+      ```
 
 
-   - `order_by` (str, optional): Only meaningful if `history_only=True`.
-     - `"count"` → total times product was ordered
-     - `"add_to_cart_order"` → average position in cart
+    - If no matches found, returns an empty list.
+    - If required fields (e.g. user ID) are missing, returns a list with an error dict.
 
 
-   - `ascending` (bool, optional): Whether to sort `order_by` field ascending (default is `False` = descending).
+    ---
+    LLM Usage Note:
+    This tool is ideal for filtered browsing, purchase history analysis, or category breakdowns.
+    """
+    if history_only:
+        user_id = get_user_id()
+        if user_id is None:
+            return [
+                {"error": "User ID not set. Please call set_user_id(user_id) first."}
+            ]
 
+        user_orders = orders[orders["user_id"] == user_id]
+        user_prior = prior.merge(user_orders[["order_id"]], on="order_id")
 
-   - `top_k` (int, optional): After filtering and sorting, returns only the top K products.
+        user_prior["product_id"] = user_prior["product_id"].astype(str)
+        products_copy = products.copy()
+        products_copy["product_id"] = products_copy["product_id"].astype(str)
+        result_df = user_prior.merge(products_copy, on="product_id")
 
+        departments_copy = departments.copy()
+        aisles_copy = aisles.copy()
 
-   - `group_by` (str, optional): If set to `"department"` or `"aisle"`, aggregates and returns counts instead of product rows.
+        if (
+            "department_id" in result_df.columns
+            and "department_id" in departments_copy.columns
+        ):
+            result_df["department_id"] = result_df["department_id"].astype(str)
+            departments_copy["department_id"] = departments_copy[
+                "department_id"
+            ].astype(str)
+            result_df = result_df.merge(
+                departments_copy, on="department_id", how="left"
+            )
 
+        if "aisle_id" in result_df.columns and "aisle_id" in aisles_copy.columns:
+            result_df["aisle_id"] = result_df["aisle_id"].astype(str)
+            aisles_copy["aisle_id"] = aisles_copy["aisle_id"].astype(str)
+            result_df = result_df.merge(aisles_copy, on="aisle_id", how="left")
 
-   - `history_only` (bool, optional):
-     - If `True`, only includes items the current user has purchased.
-     - If `False` (default), searches the full catalog.
+        group_cols = ["product_id", "product_name"]
+        if "aisle" in result_df.columns:
+            group_cols.append("aisle")
+        if "department" in result_df.columns:
+            group_cols.append("department")
 
+        agg_dict = {}
+        if "reordered" in result_df.columns:
+            agg_dict["reordered"] = "sum"
+        if "add_to_cart_order" in result_df.columns:
+            agg_dict["add_to_cart_order"] = "mean"
+        if "order_id" in result_df.columns:
+            agg_dict["order_id"] = "count"
 
-   ---
-   Dependencies:
-   - Requires global variables: `products`, `departments`, `aisles`, `prior`, `orders`
-   - Requires user ID to be set via `set_user_id(user_id)` if `history_only=True`
-   - Reads from CSVs under `./dataset/`
+        if agg_dict:
+            stats_df = result_df.groupby(group_cols).agg(agg_dict).reset_index()
 
+            rename_dict = {}
+            if "reordered" in stats_df.columns:
+                rename_dict["reordered"] = "total_reorders"
+            if "add_to_cart_order" in stats_df.columns:
+                rename_dict["add_to_cart_order"] = "avg_cart_position"
+            if "order_id" in stats_df.columns:
+                rename_dict["order_id"] = "count"
 
-   ---
-   Examples:
-   ➤ Example 1: Find catalog items in pantry containing "peanut"
-   ```json
-   {
-       "product_name": "peanut",
-       "department": "pantry"
-   }
-   ```
+            stats_df = stats_df.rename(columns=rename_dict)
 
+            if "total_reorders" in stats_df.columns:
+                stats_df["reordered"] = stats_df["total_reorders"] > 0
 
-   ➤ Example 2: Show reordered pantry products in my history
-   ```json
-   {
-       "department": "pantry",
-       "reordered": true,
-       "history_only": true
-   }
-   ```
+            result_df = stats_df
 
+    else:
+        result_df = products.copy()
 
-   ➤ Example 3: Top 5 most frequent purchases by user
-   ```json
-   {
-       "order_by": "count",
-       "top_k": 5,
-       "history_only": true
-   }
-   ```
+        departments_copy = departments.copy()
+        aisles_copy = aisles.copy()
 
+        if (
+            "department_id" in result_df.columns
+            and "department_id" in departments_copy.columns
+        ):
+            result_df["department_id"] = result_df["department_id"].astype(str)
+            departments_copy["department_id"] = departments_copy[
+                "department_id"
+            ].astype(str)
+            result_df = result_df.merge(
+                departments_copy, on="department_id", how="left"
+            )
 
-   ➤ Example 4: Count of catalog items by department
-   ```json
-   {
-       "group_by": "department"
-   }
-   ```
+        if "aisle_id" in result_df.columns and "aisle_id" in aisles_copy.columns:
+            result_df["aisle_id"] = result_df["aisle_id"].astype(str)
+            aisles_copy["aisle_id"] = aisles_copy["aisle_id"].astype(str)
+            result_df = result_df.merge(aisles_copy, on="aisle_id", how="left")
 
+    if product_name:
+        result_df = result_df[
+            result_df["product_name"].str.contains(product_name, case=False, na=False)
+        ]
 
-   ---
-   Returns:
-   - If `group_by` is used:
-     A list of dicts like:
-     ```json
-     [{"department": "pantry", "num_products": 132}, {"department": "beverages", "num_products": 89}]
-     ```
+    if department:
+        result_df = result_df[result_df["department"] == department]
 
+    if aisle:
+        result_df = result_df[
+            result_df["aisle"].str.contains(aisle, case=False, na=False)
+        ]
 
-   - Otherwise:
-     A list of dicts, each with:
-     ```json
-     {
-       "product_id": 24852,
-       "product_name": "Organic Bananas",
-       "aisle": "fresh fruits",
-       "department": "produce",
-       ... (optionally "count", "reordered", etc. if history_only=True)
-     }
-     ```
+    if history_only:
+        if reordered is not None:
+            result_df = result_df[result_df["reordered"] == reordered]
 
+        if min_orders:
+            result_df = result_df[result_df["count"] >= min_orders]
 
-   - If no matches found, returns an empty list.
-   - If required fields (e.g. user ID) are missing, returns a list with an error dict.
+        if order_by:
+            if order_by == "count":
+                result_df = result_df.sort_values(by="count", ascending=ascending)
+            elif order_by == "add_to_cart_order":
+                result_df = result_df.sort_values(
+                    by="avg_cart_position", ascending=ascending
+                )
 
+    if group_by:
+        if group_by == "department":
+            grouped = (
+                result_df.groupby("department").size().reset_index(name="num_products")
+            )
+            return grouped.to_dict(orient="records")
+        elif group_by == "aisle":
+            grouped = result_df.groupby("aisle").size().reset_index(name="num_products")
+            return grouped.to_dict(orient="records")
 
-   ---
-   LLM Usage Note:
-   This tool is ideal for filtered browsing, purchase history analysis, or category breakdowns.
-   """
-   df = products.copy()
+    if top_k:
+        result_df = result_df.head(top_k)
 
+    return result_df.to_dict(orient="records")
+    # df = products.copy()
 
-   # Ensure clean types
-   df["department_id"] = pd.to_numeric(df["department_id"], errors="coerce").astype(
-       "Int64"
-   )
-   df["aisle_id"] = pd.to_numeric(df["aisle_id"], errors="coerce").astype("Int64")
-   df.dropna(subset=["department_id", "aisle_id"], inplace=True)
-   df["department_id"] = df["department_id"].astype(int)
-   df["aisle_id"] = df["aisle_id"].astype(int)
+    # # Ensure clean types
+    # df["department_id"] = pd.to_numeric(df["department_id"], errors="coerce").astype(
+    #     "Int64"
+    # )
+    # df["aisle_id"] = pd.to_numeric(df["aisle_id"], errors="coerce").astype("Int64")
+    # df.dropna(subset=["department_id", "aisle_id"], inplace=True)
+    # df["department_id"] = df["department_id"].astype(int)
+    # df["aisle_id"] = df["aisle_id"].astype(int)
 
+    # # Merge catalog metadata
+    # enriched = df.merge(departments, on="department_id", how="left").merge(
+    #     aisles, on="aisle_id", how="left"
+    # )
 
-   # Merge catalog metadata
-   enriched = df.merge(departments, on="department_id", how="left").merge(
-       aisles, on="aisle_id", how="left"
-   )
+    # if history_only:
+    #     user_id = get_user_id()
+    #     if user_id is None:
+    #         return [{"error": "No user_id set. Cannot filter by history."}]
+    #     user_orders = orders[orders["user_id"] == user_id]
+    #     if user_orders.empty:
+    #         return [{"error": f"No orders found for user_id={user_id}"}]
+    #     merged = prior.merge(user_orders, on="order_id")
+    #     product_stats = (
+    #         merged.groupby("product_id")
+    #         .agg({"reordered": "sum", "add_to_cart_order": "mean", "order_id": "count"})
+    #         .rename(columns={"order_id": "count"})
+    #         .reset_index()
+    #     )
+    #     enriched = enriched.merge(product_stats, on="product_id", how="inner")
 
+    # # Apply filters
+    # if product_name:
+    #     enriched = enriched[
+    #         enriched["product_name"].str.contains(product_name, case=False, na=False)
+    #     ]
+    # if department:
+    #     enriched = enriched[enriched["department"] == department]
+    # if aisle:
+    #     enriched = enriched[enriched["aisle"].str.lower() == aisle.lower()]
+    # if history_only:
+    #     if reordered is not None:
+    #         enriched = (
+    #             enriched[enriched["reordered"] > 0]
+    #             if reordered
+    #             else enriched[enriched["reordered"] == 0]
+    #         )
+    #     if min_orders:
+    #         enriched = enriched[enriched["count"] >= min_orders]
+    #     if order_by:
+    #         enriched = enriched.sort_values(by=order_by, ascending=ascending)
+    # if top_k:
+    #     enriched = enriched.head(top_k)
 
-   if history_only:
-       user_id = get_user_id()
-       if user_id is None:
-           return [{"error": "No user_id set. Cannot filter by history."}]
-       user_orders = orders[orders["user_id"] == user_id]
-       if user_orders.empty:
-           return [{"error": f"No orders found for user_id={user_id}"}]
-       merged = prior.merge(user_orders, on="order_id")
-       product_stats = (
-           merged.groupby("product_id")
-           .agg({"reordered": "sum", "add_to_cart_order": "mean", "order_id": "count"})
-           .rename(columns={"order_id": "count"})
-           .reset_index()
-       )
-       enriched = enriched.merge(product_stats, on="product_id", how="inner")
+    # if group_by:
+    #     grouped = (
+    #         enriched.groupby(group_by)
+    #         .agg({"product_id": "count"})
+    #         .rename(columns={"product_id": "num_products"})
+    #         .reset_index()
+    #     )
+    #     return grouped.to_dict(orient="records")
 
-
-   # Apply filters
-   if product_name:
-       enriched = enriched[
-           enriched["product_name"].str.contains(product_name, case=False, na=False)
-       ]
-   if department:
-       enriched = enriched[enriched["department"] == department]
-   if aisle:
-       enriched = enriched[enriched["aisle"].str.lower() == aisle.lower()]
-   if history_only:
-       if reordered is not None:
-           enriched = (
-               enriched[enriched["reordered"] > 0]
-               if reordered
-               else enriched[enriched["reordered"] == 0]
-           )
-       if min_orders:
-           enriched = enriched[enriched["count"] >= min_orders]
-       if order_by:
-           enriched = enriched.sort_values(by=order_by, ascending=ascending)
-   if top_k:
-       enriched = enriched.head(top_k)
-
-
-   if group_by:
-       grouped = (
-           enriched.groupby(group_by)
-           .agg({"product_id": "count"})
-           .rename(columns={"product_id": "num_products"})
-           .reset_index()
-       )
-       return grouped.to_dict(orient="records")
-
-
-   return enriched.to_dict(orient="records")
-
-
+    # return enriched.to_dict(orient="records")
 
 
 # TODO
@@ -329,26 +389,27 @@ _embeddings = None
 _vector_store = None
 
 
-# "TODO"
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="mixedbread-ai/mxbai-embed-large-v1",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+
 def get_vector_store():
-    global _vector_store, _embeddings
-    if _vector_store is None:
-        if _embeddings is None:
-            # _embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-            _embeddings = HuggingFaceEmbeddings(model_name="mixedbread-ai/mxbai-embed-large-v1")
-        _vector_store = Chroma(
-            persist_directory=CHROMA_DIR,
-            collection_name=CHROMA_COLLECTION,
-            embedding_function=_embeddings
-        )
-    return _vector_store
+    return Chroma(
+        collection_name=CHROMA_COLLECTION,
+        embedding_function=get_embeddings(),
+        persist_directory=CHROMA_DIR,  # Where to save data locally, remove if not necessary
+    )
 
 
 def make_query_prompt(query: str) -> str:
     return f"Represent this sentence for searching relevant passages: {query.strip().replace(chr(10), ' ')}"
 
 
-# "TODO"
+# TODO
 def search_products(query: str, top_k: int = 5):
     """
     Perform a semantic vector search over the product catalog using HuggingFace embeddings and Chroma.
@@ -391,26 +452,27 @@ def search_products(query: str, top_k: int = 5):
     ]
     ```
     """
-    vector_store = get_vector_store()
-    prompt_query = make_query_prompt(query)
-    results = vector_store.similarity_search(prompt_query, k=top_k)
-    if not results:
-        return []
-    return [
-        {
-            "product_id": int(doc.metadata["product_id"]),
-            "product_name": doc.metadata["product_name"],
-            "aisle": doc.metadata["aisle"],
-            "department": doc.metadata["department"],
-            "text": doc.page_content,
-        }
-        for doc in results
-    ]
+    try:
+        vector_store = get_vector_store()
+        prompt_query = make_query_prompt(query)
+        results = vector_store.similarity_search(prompt_query, k=top_k)
+        return [
+            {
+                "product_id": result.metadata["product_id"],
+                "product_name": result.metadata["product_name"],
+                "aisle": result.metadata["aisle"],
+                "department": result.metadata["department"],
+                "text": result.page_content,
+            }
+            for result in results
+        ]
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # TODO
 @tool
-def search_tool(query: str) -> str:
+def search_tool(query: str, top_k: int = 5) -> str:
     """
     Tool-decorated function that performs semantic product search using vector similarity,
     formats the results into a human-readable response, and is callable by a LangChain agent.
@@ -464,7 +526,21 @@ def search_tool(query: str) -> str:
     search_tool("something high protein for breakfast")
     ```
     """
-    pass
+    try:
+        results = search_products(query)
+        if not results:
+            return "No products found matching your search."
+        return "\n".join(
+            [
+                f"- {result['product_name']} (ID: {result['product_id']})"
+                # f"  Aisle: {result['aisle']}\n"
+                # f"  Department: {result['department']}\n"
+                # f"  Details: {result['text']}\n"
+                for result in results
+            ]
+        )
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # ---- UPDATED: Cart tools with quantity support ----
@@ -616,7 +692,16 @@ def create_tool_node_with_fallback(tools: list) -> ToolNode:
     Returns:
     - ToolNode: A LangGraph-compatible tool node with error fallback logic.
     """
-    pass
+    # Create a ToolNode with the provided tools
+    node = ToolNode(tools)
+
+    # Attach the fallback mechanism using handle_tool_error
+    # The exception_key="error" ensures LangGraph recognizes failure states
+    node = node.with_fallbacks(
+        [RunnableLambda(handle_tool_error)], exception_key="error"
+    )
+
+    return node
 
 
 __all__ = [
